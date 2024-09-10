@@ -1,0 +1,3 @@
+select * from INFORMATION_SCHEMA.PROCESSLIST where COMMAND <> 'sleep' ORDER BY TIME DESC;
+
+

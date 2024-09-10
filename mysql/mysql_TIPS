@@ -1,0 +1,160 @@
+=====================
+1) sessions:
+
+show processlist;
+
+
+db - database_name
+command - Sleep, Execute, Query
+
+select * from INFORMATION_SCHEMA.PROCESSLIST 
+where db = 'security_antifraud' 
+and command = 'Execute'
+
+
+select thd_id, user, db, command, full_scan, current_statement from sys.session where command not in ('Sleep');
+
+       select concat('KILL ',id,';'), time from information_schema.processlist where user='teste' and info is null order by time
+
+
+=====================
+2) consumer cpu:
+
+
+=====================
+3) consumer mem:
+
+
+=====================
+4) size table:
+
+SELECT 
+	   CONCAT(table_schema, '.', table_name) as "TABLE_SCHEMA.TABLE_NAME",
+       CONCAT(ROUND(table_rows / 1000000, 2), 'M') as LINHAS,
+       CONCAT(ROUND(data_length / ( 1024 * 1024 * 1024 ), 2), 'G') as DATA,
+       CONCAT(ROUND(index_length / ( 1024 * 1024 * 1024 ), 2), 'G') as INDICE,
+       CONCAT(ROUND(( data_length + index_length ) / ( 1024 * 1024 * 1024 ), 2), 'G') as TOTAL_SIZE,
+       ROUND(index_length / data_length, 2) as IDXFRAC
+FROM   information_schema.TABLES where table_name = 'STDIN_MUDANCA_SALDO'
+ORDER  BY data_length + index_length DESC
+LIMIT  10;
+
+
+
+
+=====================
+5) explain:
+
+explain select * from <table_name>;
+
+=====================
+6) configuration - standin:
+
+
+EXPLICIT_DEFAULTS_FOR_TIMESTAMP 1 --- unlimited column timestamp
+
+DEFAULT_CHARACTER_SET_NAME  utf8
+
+DEFAULT_COLLATION_NAME utf8_general_ci
+
+=====================
+7) show index for table:
+
+
+SHOW INDEX FROM mytable FROM mydb;
+SHOW INDEX FROM mydb.mytable;
+
+
+=====================
+8) check statistics:
+
+SELECT * FROM information_schema.statistics;
+
+
+=====================
+9) check table_name of the column_name
+
+SELECT table_name,GROUP_CONCAT(column_name ORDER BY ordinal_position)
+FROM information_schema.columns
+WHERE table_schema = DATABASE()
+and column_name like '%equest_id%'
+GROUP BY table_name
+ORDER BY table_name
+
+
+=====================
+10) time out error 
+
+ajustar os parametros: 
+
+'host_cache_size' 		--- alterar para 300
+'skip_name_resolve'; 	--- alterar para 1
+'max_connect_errors'; 	--- alterar para 10000
+
+
+=====================
+11) check foreign key  - FK 
+
+
+SELECT 	TABLE_NAME, COLUMN_NAME, 
+		CONSTRAINT_NAME, REFERENCED_TABLE_NAME, 
+		REFERENCED_COLUMN_NAME 
+FROM information_schema.KEY_COLUMN_USAGE 
+WHERE REFERENCED_TABLE_SCHEMA = 'mstandin' 
+
+
+=====================
+12) export & import 
+
+-- dump da tabela: node_property da base de dados: db-prd-flexvision-13jan
+
+### export 
+
+mysqldump -h ct-rds-uat-account-instant-payment.cluster-c30dl4awyeay.sa-east-1.rds.amazonaws.com -u pveloso account_instant_payment -p --column-statistics=0 --set-gtid-purged=OFF  > C:\Users\07.000508.CBSSDIGITAL\Desktop\pedro\export_import\exp_account_instant_payment.sql
+mysqldump -h pedro-payment.ceip7fi02lcw.sa-east-1.rds.amazonaws.com -u pveloso account_instant_payment -ppveloso --column-statistics=0 --set-gtid-purged=OFF  > /dba/exp_account_instant_payment.sql
+
+export without data
+
+mysqldump -h rds-ibi-com-br-prd.ceip7fi02lcw.sa-east-1.rds.amazonaws.com --column-statistics=0 --set-gtid-purged=OFF --no-data -u pveloso -p ibi_digital > D:\DBA\ibi_digital_DDL.sql
+
+
+### import 
+
+mysql -h rds-prd-cd-account-manager.ceip7fi02lcw.sa-east-1.rds.amazonaws.com -u pveloso account_manager -p < C:\Users\07.000508.CBSSDIGITAL\Desktop\pedro\export_import\exp_account_manager_31MAIO2021.sql
+
+=====================
+13) check user e grants
+
+
+ SELECT 
+  md.user `User`,
+  mu.password_last_changed `Last_Change_Password`,
+  md.db `Database`,
+  REPLACE(RTRIM(CONCAT(
+  IF(md.Select_priv = 'Y', 'Select ', ''),
+  IF(md.Insert_priv = 'Y', 'Insert ', ''),
+  IF(md.Update_priv = 'Y', 'Update ', ''),
+  IF(md.Delete_priv = 'Y', 'Delete ', ''),
+  IF(md.Create_priv = 'Y', 'Create ', ''),
+  IF(md.Drop_priv = 'Y', 'Drop ', ''),
+  IF(md.Grant_priv = 'Y', 'Grant ', ''),
+  IF(md.References_priv = 'Y', 'References ', ''),
+  IF(md.Index_priv = 'Y', 'Index ', ''),
+  IF(md.Alter_priv = 'Y', 'Alter ', ''),
+  IF(md.Create_tmp_table_priv = 'Y', 'Create_tmp_table ', ''),
+  IF(md.Lock_tables_priv = 'Y', 'Lock_tables ', ''),
+  IF(md.Create_view_priv = 'Y', 'Create_view ', ''),
+  IF(md.Show_view_priv = 'Y', 'Show_view ', ''),
+  IF(md.Create_routine_priv = 'Y', 'Create_routine ', ''),
+  IF(md.Alter_routine_priv = 'Y', 'Alter_routine ', ''),
+  IF(md.Execute_priv = 'Y', 'Execute ', ''),
+  IF(md.Event_priv = 'Y', 'Event ', ''),
+  IF(md.Trigger_priv = 'Y', 'Trigger ', '')
+  )), ' ', ', ') AS `Privileges`
+ FROM
+  mysql.db md, mysql.user mu
+  where md.user = mu.user
+ ORDER BY
+  md.Host,
+  md.User,
+  md.Db

@@ -1,0 +1,1154 @@
+=====================
+1) Desabilitar firewall no windows:
+net stop sharedaccess
+
+=====================
+2) Verificar coleta de estatisticas:
+
+-- TABLE 
+
+SELECT t.name TableName, s.[name] StatName, STATS_DATE(t.object_id,s.[stats_id]) LastUpdated 
+FROM sys.[stats] AS s
+JOIN sys.[tables] AS t
+    ON [s].[object_id] = [t].[object_id]
+WHERE t.type = 'u'
+;
+
+
+=====================
+3) Verificar coleta de estatisticas:
+
+-- TABLE 
+-- INDEX 
+
+SELECT dbschemas.[name] as 'Schema',
+dbtables.[name] as 'Table',
+dbindexes.[name] as 'Index',
+indexstats.avg_fragmentation_in_percent,
+indexstats.page_count
+FROM sys.dm_db_index_physical_stats (DB_ID(), NULL, NULL, NULL, NULL) AS indexstats
+INNER JOIN sys.tables dbtables on dbtables.[object_id] = indexstats.[object_id]
+INNER JOIN sys.schemas dbschemas on dbtables.[schema_id] = dbschemas.[schema_id]
+INNER JOIN sys.indexes AS dbindexes ON dbindexes.[object_id] = indexstats.[object_id]
+AND indexstats.index_id = dbindexes.index_id
+WHERE indexstats.database_id = DB_ID()
+ORDER BY indexstats.avg_fragmentation_in_percent desc
+
+
+dbcc showcontig (table_name)
+
+
+=====================
+4) rename database
+
+-- pra renomear database Joao para Pedro
+
+alter database Pedro set restricted_user with rollback immediate
+go
+sp_renamedb Joao, Pedro
+go
+alter database Pedro set multi_user
+go
+
+
+
+=====================
+5) backup database
+
+-- alterar to disk, sempre que necessario:
+
+backup database Pedro to disk='d:\Pedro.bkp' with stats=1, compression
+
+
+-- verificando o backup: 
+
+select * from msdb..backupset where database_name ='FICCCBSS' order by backup_start_date desc
+
+=====================
+5.1) backup & restore database RDS - SQL SERVER:
+
+--offline
+ALTER DATABASE [FICNABCBSS] SET OFFLINE WITH ROLLBACK IMMEDIATE
+--online
+EXEC rdsadmin.dbo.rds_set_database_online FICNABCBSS
+
+--bkp  (alterar o s3 e nome do banco)
+select 
+		  ' exec msdb.dbo.rds_backup_database @source_db_name=''' + name +''', @s3_arn_to_backup_to='''+'arn:aws:s3:::rds-backup-sql-funcao/11-FEV-2022/'+name+'_11FEV2022.BAK''' + CHAR(13)
+		+ ' go ' 
+from sys.databases 
+where name = 'FICNABCBSS'
+order by 1 
+
+--rename database
+use master
+go
+ALTER DATABASE FICNABCBSS SET SINGLE_USER WITH ROLLBACK IMMEDIATE
+GO
+EXEC rdsadmin.dbo.rds_modify_db_name N'FICNABCBSS', N'FICNABCBSS_OLD'
+GO
+ALTER DATABASE FICNABCBSS_OLD SET MULTI_USER
+GO
+
+
+--check restore 
+EXEC [msdb].[dbo].[rds_task_status]
+
+
+--restore
+exec msdb.dbo.rds_restore_database @restore_db_name='FICNABCBSS', 
+@s3_arn_to_restore_from='arn:aws:s3:::rds-backup-sql-funcao/11-FEV-2022/FICNABCBSS_11FEV2022.BAK'
+
+=====================
+6) check logical name
+
+-- execute o comando abaixo para pegar o Logical name
+
+restore filelistonly from disk= 'd:\Pedro.bkp'
+
+
+=====================
+7) restore database
+
+--Coloque o Logical name que pegou acima depois do Move ('Pedro', 'Pedro_log') e coloque o diretorio que vai ser o destino do database
+-- Mate as conexões do banco que vai sofrer restore
+
+use master
+go
+alter database Pedro set restricted_user with rollback immediate
+go
+restore database Pedro from disk='d:\Pedro.bkp'
+with move 'Pedro'		to 'f:\dba\Mssql\Data\Pedro.mdf',
+     move 'Pedro_log'	to 'f:\dba\Mssql\Log\Pedro_log.ldf',
+	 stats=1,replace
+go
+alter database Pedro set multi_user
+go
+
+
+=====================
+8) consumindo cpu:
+
+
+SELECT sqltext.TEXT,
+req.session_id,
+req.status,
+req.command,
+req.cpu_time,
+req.total_elapsed_time
+FROM sys.dm_exec_requests req
+CROSS APPLY sys.dm_exec_sql_text(sql_handle) AS sqltext
+
+DBCC INPUTBUFFER(269)
+
+## v2 CPU 
+SELECT s.session_id,
+    r.status,
+    r.blocking_session_id 'Blk by',
+    r.wait_type,
+    wait_resource,
+    r.wait_time / (1000 * 60) 'Wait M',
+    r.cpu_time,
+    r.logical_reads,
+    r.reads,
+    r.writes,
+    r.total_elapsed_time / (1000 * 60) 'Elaps M',
+    Substring(st.TEXT,(r.statement_start_offset / 2) + 1,
+    ((CASE r.statement_end_offset
+WHEN -1
+THEN Datalength(st.TEXT)
+ELSE r.statement_end_offset
+END - r.statement_start_offset) / 2) + 1) AS statement_text,
+    Coalesce(Quotename(Db_name(st.dbid)) + N'.' + Quotename(Object_schema_name(st.objectid, st.dbid)) + N'.' +
+    Quotename(Object_name(st.objectid, st.dbid)), '') AS command_text,
+    r.command,
+    s.login_name,
+    s.host_name,
+    s.program_name,
+    s.last_request_end_time,
+    s.login_time,
+    r.open_transaction_count
+FROM sys.dm_exec_sessions AS s
+    JOIN sys.dm_exec_requests AS r
+ON r.session_id = s.session_id
+    CROSS APPLY sys.Dm_exec_sql_text(r.sql_handle) AS st
+WHERE r.session_id != @@SPID
+ORDER BY r.cpu_time desc
+
+
+## grafico 
+
+DECLARE @gc VARCHAR(MAX), @gi VARCHAR(MAX);
+WITH BR_Data as (
+SELECT timestamp, CONVERT(XML, record) as record
+FROM sys.dm_os_ring_buffers
+WHERE ring_buffer_type = N'RING_BUFFER_SCHEDULER_MONITOR' and record like '%<SystemHealth>%'
+), Extracted_XML as (
+SELECT timestamp, record.value('(./Record/@id)[1]', 'int') as record_id,
+record.value('(./Record/SchedulerMonitorEvent/SystemHealth/SystemIdle)[1]', 'bigint') as SystemIdle,
+record.value('(./Record/SchedulerMonitorEvent/SystemHealth/ProcessUtilization)[1]', 'bigint') as SQLCPU
+FROM BR_Data
+), CPU_Data as (
+SELECT record_id, ROW_NUMBER() OVER(ORDER BY record_id) as rn,
+dateadd(ms, -1 * ((SELECT ms_ticks FROM sys.dm_os_sys_info) - [timestamp]), GETDATE()) as EventTime,
+SQLCPU, SystemIdle, 100 - SystemIdle - SQLCPU as OtherCPU
+FROM Extracted_XML )
+SELECT @gc = CAST((SELECT CAST(d1.rn as VARCHAR) + ' ' + CAST(d1.SQLCPU as VARCHAR) + ',' FROM CPU_Data as d1 ORDER BY d1.rn FOR XML PATH('')) as VARCHAR(MAX)),
+@gi = CAST((SELECT CAST(d1.rn as VARCHAR) + ' ' + CAST(d1.OtherCPU as VARCHAR) + ',' FROM CPU_Data as d1 ORDER BY d1.rn FOR XML PATH('')) as VARCHAR(MAX))
+OPTION (RECOMPILE);
+
+SELECT CAST('LINESTRING(' + LEFT(@gc,LEN(@gc)-1) + ')' as GEOMETRY), 'SQL CPU %' as Measure
+UNION ALL
+SELECT CAST('LINESTRING(1 100,2 100)' as GEOMETRY), ''
+UNION ALL
+SELECT CAST('LINESTRING(' + LEFT(@gi,LEN(@gi)-1) + ')' as GEOMETRY), 'Other CPU %';
+
+=====================
+
+# Last Execution Date Time of a Stored Procedure
+
+SELECT 
+  O.name,
+  PS.last_execution_time, ps.execution_count, ps.min_worker_time, ps.max_worker_time
+FROM 
+  sys.dm_exec_procedure_stats PS 
+INNER JOIN sys.objects O 
+  ON O.[object_id] = PS.[object_id] 
+  where o.name = 'FI_SP_C3_MigraELIBEV2'
+  
+  FI_SP_C3_MigraELIBEV2 e FI_SP_C3_MigraCDOCSV4
+=====================
+
+# Last DDL Date Time of a Stored Procedure
+  
+  SELECT name, create_date, modify_date 
+FROM sys.objects
+WHERE type = 'P'
+and name = 'FI_sp_EM_MTRLEXINV3'
+ORDER BY modify_date DESC
+
+
+=====================
+9) Verificar login no servidor sql:
+
+https://www.sqlserver-dba.com/2019/07/how-to-check-the-sa-sql-login-is-disabled.html
+
+is_disabled = 0 -- está ativo
+is_disabled = 1 -- não está inativo
+
+
+SELECT name, is_disabled FROM sys.server_principals where name='pveloso'
+
+
+select s.name, s.createdate,
+loginproperty (s.name, 'PasswordLastSetTime') PasswordLastSetTime, 
+loginproperty (s.name, 'IsExpired') IsExpired,
+loginproperty (s.name, 'IsMustChange') IsMustChange,
+case P.is_disabled when 1 then ('Desativado') else ('Ativo') end as [Status],
+l.is_policy_checked
+from sys.syslogins s 
+inner join sys.server_principals p on s.name = p.name
+order by [name]
+
+
+select 
+l.name,
+l.create_date,
+l.modify_date,
+loginproperty (s.name, 'PasswordLastSetTime') PasswordLastSetTime, 
+loginproperty (s.name, 'IsExpired') IsExpired,
+loginproperty (s.name, 'IsMustChange') IsMustChange,
+l.is_policy_checked,
+case P.is_disabled when 1 then ('Desativado') else ('Ativo') end as [Status]
+from sys.syslogins as S
+full outer join sys.sql_logins L on s.name = l.name
+inner join sys.server_principals as P on p.name = l.name
+order by [name]
+
+
+=====================
+10) Verificar privilegios no servidor sql:
+
+use tempdb
+IF OBJECT_ID('tempdb..#user_table') IS NOT NULL
+BEGIN
+    DROP TABLE #user_table;
+END;
+
+-- tmp Table to hold the user data
+CREATE TABLE #user_table
+(
+    ServerName NVARCHAR(100) NULL,
+    [Database] NVARCHAR(256) NULL,
+    UserName NVARCHAR(128) NOT NULL,
+    GroupName NVARCHAR(128) NULL,
+    LoginName NVARCHAR(128) NULL,
+    DefDBName NVARCHAR(256) NULL,
+    DefSchemaName NVARCHAR(100) NULL,
+    UserID INTEGER NOT NULL,
+    [SID] UNIQUEIDENTIFIER NULL
+);    
+
+DECLARE @sql NVARCHAR(MAX);
+SET @sql = '
+   DECLARE 	@name SYSNAME,
+			@sql_string NVARCHAR(MAX);
+    -- Cursor containing all users for the current database context
+    DECLARE usr_name CURSOR READ_ONLY FOR SELECT [name]
+                                          FROM sysusers
+                                          WHERE hasdbaccess = 1
+                                          AND [name] NOT LIKE ''#%''
+                                          AND [name] NOT IN (''guest'');
+    OPEN usr_name;
+    FETCH NEXT FROM usr_name INTO @name;
+
+    WHILE (@@FETCH_STATUS = 0) -- This loop processes each database
+    BEGIN
+
+        -- if it''s a windows login surround with square brackets
+        IF (@name LIKE ''%\%'')
+        BEGIN
+            SET @name = ''['' + @name + '']'';
+        END
+
+        SET @sql_string = N''EXEC sp_helpuser '' + @name;
+
+        INSERT INTO #user_table
+        (
+            UserName,
+            GroupName,
+            LoginName,
+            DefDBName,
+            DefSchemaName,
+            UserId,
+            [SID]
+        )
+        EXEC(@sql_string); 
+
+        -- Add Server &amp; database name to dataset
+        UPDATE #user_table
+        SET ServerName = @@SERVERNAME,
+        [Database] = DB_NAME()
+        WHERE ServerName IS NULL
+        AND [Database] IS NULL;
+
+        -- Get the next database user
+        FETCH NEXT FROM usr_name INTO @name; -- Get next user
+
+    END
+
+    -- Clean up
+    CLOSE usr_name;
+    DEALLOCATE usr_name;';
+
+-- Add USE database statement to change db context
+SET @sql = 'USE ?; ' + @sql;
+-- Execute the string for each database
+EXEC sp_MSforeachDB @sql;
+
+
+
+SELECT LoginName, "Database", UserName, GroupName FROM #user_table
+where username in ('consulta_cbss', 'is-btcofre','da_leitor_fn') ORDER BY Username, [Database];
+
+
+=====================
+11) Check Always on
+
+
+-- check the availability group name;
+-- check the database in each AG;
+-- check the server primary replica name;
+
+
+SELECT Groups.[Name] AS AGname, States.[primary_replica] as NodePrimario
+FROM sys.dm_hadr_availability_group_states States
+INNER JOIN master.sys.availability_groups Groups ON States.group_id = Groups.group_id
+;
+
+SELECT 	Groups.[Name] AS AGname,
+		AGDatabases.database_name AS Databasename, 
+		States.[primary_replica] as NodePrimario
+FROM sys.dm_hadr_availability_group_states States
+INNER JOIN master.sys.availability_groups Groups ON States.group_id = Groups.group_id
+INNER JOIN sys.availability_databases_cluster AGDatabases ON Groups.group_id = AGDatabases.group_id
+ORDER BY
+AGname ASC,
+Databasename ASC;
+
+
+--Show Availability groups visible to the Server and Replica information such as Which server is the Primary
+--Sync and Async modes , Readable Secondary and Failover Mode, these can all be filtered using a Where clause
+--if you are running some checks, no Where clause will show you all of the information.
+
+WITH AGStatus AS(
+SELECT
+name as AGname,
+replica_server_name,
+CASE WHEN  (primary_replica  = replica_server_name) THEN  1
+ELSE  '' END AS IsPrimaryServer,
+secondary_role_allow_connections_desc AS ReadableSecondary,
+[availability_mode]  AS [Synchronous],
+failover_mode_desc
+FROM master.sys.availability_groups Groups
+INNER JOIN master.sys.availability_replicas Replicas ON Groups.group_id = Replicas.group_id
+INNER JOIN master.sys.dm_hadr_availability_group_states States ON Groups.group_id = States.group_id
+)
+ 
+Select
+[AGname],
+[Replica_server_name],
+[IsPrimaryServer],
+[Synchronous],
+[ReadableSecondary],
+[Failover_mode_desc]
+FROM AGStatus
+WHERE IsPrimaryServer = 1
+AND Synchronous = 1
+ORDER BY
+AGname ASC,
+IsPrimaryServer DESC;
+
+
+
+-- check information last commit;
+-- check information synchronization type 
+
+SET NOCOUNT ON;
+ 
+DECLARE @AGname NVARCHAR(128);
+ 
+DECLARE @SecondaryReplicasOnly BIT;
+ 
+--SET @AGname = 'AG1';        --SET AGname for a specific AG for SET to NULL for ALL AG's
+ 
+IF OBJECT_ID('TempDB..#tmpag_availability_groups') IS NOT NULL
+DROP TABLE [#tmpag_availability_groups];
+ 
+SELECT *
+INTO [#tmpag_availability_groups]
+FROM   [master].[sys].[availability_groups];
+ 
+IF(@AGname IS NULL
+OR EXISTS
+(
+SELECT [Name]
+FROM   [#tmpag_availability_groups]
+WHERE  [Name] = @AGname
+))
+BEGIN
+ 
+IF OBJECT_ID('TempDB..#tmpdbr_availability_replicas') IS NOT NULL
+DROP TABLE [#tmpdbr_availability_replicas];
+ 
+IF OBJECT_ID('TempDB..#tmpdbr_database_replica_cluster_states') IS NOT NULL
+DROP TABLE [#tmpdbr_database_replica_cluster_states];
+ 
+IF OBJECT_ID('TempDB..#tmpdbr_database_replica_states') IS NOT NULL
+DROP TABLE [#tmpdbr_database_replica_states];
+ 
+IF OBJECT_ID('TempDB..#tmpdbr_database_replica_states_primary_LCT') IS NOT NULL
+DROP TABLE [#tmpdbr_database_replica_states_primary_LCT];
+ 
+IF OBJECT_ID('TempDB..#tmpdbr_availability_replica_states') IS NOT NULL
+DROP TABLE [#tmpdbr_availability_replica_states];
+ 
+SELECT [group_id],
+[replica_id],
+[replica_server_name],
+[availability_mode],
+[availability_mode_desc]
+INTO [#tmpdbr_availability_replicas]
+FROM   [master].[sys].[availability_replicas];
+ 
+SELECT [replica_id],
+[group_database_id],
+[database_name],
+[is_database_joined],
+[is_failover_ready]
+INTO [#tmpdbr_database_replica_cluster_states]
+FROM   [master].[sys].[dm_hadr_database_replica_cluster_states];
+ 
+SELECT *
+INTO [#tmpdbr_database_replica_states]
+FROM   [master].[sys].[dm_hadr_database_replica_states];
+ 
+SELECT [replica_id],
+[role],
+[role_desc],
+[is_local]
+INTO [#tmpdbr_availability_replica_states]
+FROM   [master].[sys].[dm_hadr_availability_replica_states];
+ 
+SELECT [ars].[role],
+[drs].[database_id],
+[drs].[replica_id],
+[drs].[last_commit_time]
+INTO [#tmpdbr_database_replica_states_primary_LCT]
+FROM   [#tmpdbr_database_replica_states] AS [drs]
+LEFT JOIN [#tmpdbr_availability_replica_states] [ars] ON [drs].[replica_id] = [ars].[replica_id]
+WHERE  [ars].[role] = 1;
+ 
+SELECT [AG].[name] AS [AvailabilityGroupName],
+[AR].[replica_server_name] AS [AvailabilityReplicaServerName],
+[dbcs].[database_name] AS [AvailabilityDatabaseName],
+ISNULL([dbcs].[is_failover_ready],0) AS [IsFailoverReady],
+ISNULL([arstates].[role_desc],3) AS [ReplicaRole],
+[AR].[availability_mode_desc] AS [AvailabilityMode],
+CASE [dbcs].[is_failover_ready]
+WHEN 1
+THEN 0
+ELSE ISNULL(DATEDIFF([ss],[dbr].[last_commit_time],[dbrp].[last_commit_time]),0)
+END AS [EstimatedDataLoss_(Seconds)],
+ISNULL(CASE [dbr].[redo_rate]
+WHEN 0
+THEN-1
+ELSE CAST([dbr].[redo_queue_size] AS FLOAT) / [dbr].[redo_rate]
+END,-1) AS [EstimatedRecoveryTime_(Seconds)],
+ISNULL([dbr].[is_suspended],0) AS [IsSuspended],
+ISNULL([dbr].[suspend_reason_desc],'-') AS [SuspendReason],
+ISNULL([dbr].[synchronization_state_desc],0) AS [SynchronizationState],
+ISNULL([dbr].[last_received_time],0) AS [LastReceivedTime],
+ISNULL([dbr].[last_redone_time],0) AS [LastRedoneTime],
+ISNULL([dbr].[last_sent_time],0) AS [LastSentTime],
+ISNULL([dbr].[log_send_queue_size],-1) AS [LogSendQueueSize],
+ISNULL([dbr].[log_send_rate],-1) AS [LogSendRate_KB/S],
+ISNULL([dbr].[redo_queue_size],-1) AS [RedoQueueSize_KB],
+ISNULL([dbr].[redo_rate],-1) AS [RedoRate_KB/S],
+ISNULL(CASE [dbr].[log_send_rate]
+WHEN 0
+THEN-1
+ELSE CAST([dbr].[log_send_queue_size] AS FLOAT) / [dbr].[log_send_rate]
+END,-1) AS [SynchronizationPerformance],
+ISNULL([dbr].[filestream_send_rate],-1) AS [FileStreamSendRate],
+ISNULL([dbcs].[is_database_joined],0) AS [IsJoined],
+[arstates].[is_local] AS [IsLocal],
+ISNULL([dbr].[last_commit_lsn],0) AS [LastCommitLSN],
+ISNULL([dbr].[last_commit_time],0) AS [LastCommitTime],
+ISNULL([dbr].[last_hardened_lsn],0) AS [LastHardenedLSN],
+ISNULL([dbr].[last_hardened_time],0) AS [LastHardenedTime],
+ISNULL([dbr].[last_received_lsn],0) AS [LastReceivedLSN],
+ISNULL([dbr].[last_redone_lsn],0) AS [LastRedoneLSN]
+FROM   [#tmpag_availability_groups] AS [AG]
+INNER JOIN [#tmpdbr_availability_replicas] AS [AR] ON [AR].[group_id] = [AG].[group_id]
+INNER JOIN [#tmpdbr_database_replica_cluster_states] AS [dbcs] ON [dbcs].[replica_id] = [AR].[replica_id]
+LEFT OUTER JOIN [#tmpdbr_database_replica_states] AS [dbr] ON [dbcs].[replica_id] = [dbr].[replica_id]
+AND [dbcs].[group_database_id] = [dbr].[group_database_id]
+LEFT OUTER JOIN [#tmpdbr_database_replica_states_primary_LCT] AS [dbrp] ON [dbr].[database_id] = [dbrp].[database_id]
+INNER JOIN [#tmpdbr_availability_replica_states] AS [arstates] ON [arstates].[replica_id] = [AR].[replica_id]
+WHERE  [AG].[name] = ISNULL(@AGname,[AG].[name])
+ORDER BY [AvailabilityReplicaServerName] ASC,
+[AvailabilityDatabaseName] ASC;
+ 
+/*********************/
+ 
+END;
+ELSE
+BEGIN
+RAISERROR('Invalid AG name supplied, please correct and try again',12,0);
+END;
+
+
+
+
+=====================
+12) enable lock pages in memory e reservar a memória para instancia do sql server : 
+
+https://blog.sqlauthority.com/2019/09/16/sql-server-enable-lock-pages-in-memory-lpim/
+
+=====================
+13) shrink file : 
+
+dbcc shrinkfile(CBSBACEN_log,1024)
+
+
+=====================
+14) fragmentação da tabela : 
+
+dbcc showcontig(ECONF)
+
+
+=====================
+15) frag
+
+declare @dbid int
+select  @dbid = db_id()
+select distinct top 200  si.name, si.rowcnt,dm.avg_fragmentation_in_percent,
+'alter index '+ si.name +' on '+object_name(object_id) +' rebuild with (online=off,sort_in_tempdb=on)'
+from sys.dm_db_index_physical_stats(@dbid,null,null,null,null) dm
+        inner join sys.sysindexes si
+                on dm.object_id = si.id and dm.index_id=si.indid
+where --si.indid=1 -- cluster
+ si.rowcnt between 100000 And 250000000
+and name not like '%wk%'
+order by dm.avg_fragmentation_in_percent desc ,si.rowcnt,  si.name desc
+ 
+ 
+=====================
+16) grant for all database for on specific user 
+
+
+USE master
+GO
+DECLARE @LoginName varchar(256)
+SET @LoginName ='elias.salani'
+SELECT 'USE [' + Name + ']' + Char(13)
++ ' ' + Char(13)
++ 'EXEC sp_addrolemember ''db_owner'', '''+ @LoginName + ''''
+AS ScriptToExecute
+FROM sys.databases
+WHERE name NOT IN ('Master','tempdb','model','msdb') -- Avoid System Databases
+AND (state_desc ='ONLINE') -- Avoid Offline Databases
+AND (source_database_id Is Null) -- Avoid Database Snapshot
+ORDER BY Name
+
+
+
+ 
+=====================
+17) check size db and log :
+
+exec sp_dba_helpdb_space 
+
+
+
+use master
+
+CREATE proc sp_dba_helpdb_space
+ @db_name varchar(255) = null
+ ,@volume char(1) = null
+ ,@result bit = 1
+as
+ 
+declare  @aux   varchar(255)
+  
+ ,@db   varchar(255)
+ ,@fileid  int
+ ,@status  int
+ ,@flname  varchar(60)
+ ,@fpname  varchar(60)
+ ,@size   int
+ 
+ ,@nm_file_logic  varchar(255)
+ ,@qt_spc_tot  numeric(20,2)
+ ,@qt_spc_ocp  numeric(20,2)
+ ,@tp_file  char(1)
+ ,@nm_file_phys  varchar(255)
+ ,@qt_free_spc_drv numeric(20,2)
+ 
+ ,@maxlenlogic  tinyint
+ ,@maxlenphys  tinyint
+ 
+ ,@winver  varchar(4)
+  
+begin
+ set nocount on
+ 
+ --Verifica a versao do sistema operacional
+ create table #t_winv (
+   v_index  smallint
+  ,v_name   varchar(30)
+  ,v_internal_value int
+  ,v_character_value varchar(30))
+  
+ insert into #t_winv
+ exec master..xp_msver 'windowsversion'
+ 
+ select @winver =  case left(v_character_value,1)
+     when '4' then '4.0'
+     when '5' then '2000'
+    end
+ from #t_winv
+ 
+ drop table #t_winv
+ --***************************************
+ 
+ create table #t_db (
+   nm_db   varchar(255) not null
+  ,nm_file_logic  varchar(255) not null
+  ,qt_spc_tot  numeric(20,2) not null
+  ,qt_spc_ocp  numeric(20,2) null
+  ,tp_file  char(1)  not null
+  ,nm_file_phys  varchar(255) not null
+  ,qt_free_spc_drv numeric(20,2) null)
+ 
+ --create table #t_free_spc (
+ -- codigo  int identity
+ -- ,texto  varchar(150))
+  
+ create table #t_free_spc (
+  nm_drv  char(1)
+  ,vl_free int)
+   
+ 
+ if @db_name is null or @db_name = '%'
+ begin
+  select @db_name = '%'
+ end
+ 
+ declare cr_db cursor local fast_forward for
+ select name from sysdatabases  
+ where name like @db_name
+ and status & 32 <> 32
+ and status & 512 <> 512
+ order by name
+ 
+ open cr_db
+ 
+ fetch next from cr_db into @db
+ 
+ while @@fetch_status <> -1
+ begin
+  create table #t_file (
+    fileid  smallint
+   ,groupid smallint
+   ,totalextents int
+   ,usedextents int
+   ,flname  varchar(255)
+   ,fpname  varchar(255))
+    
+  select @aux  = 'declare cr_file cursor global fast_forward for '
+    + 'select fileid, status, name, filename, size from [' + @db + ']..sysfiles'
+  
+  exec (@aux)
+ 
+  open cr_file
+ 
+  fetch next from cr_file into @fileid, @status, @flname, @fpname, @size
+ 
+  while @@fetch_status <> -1
+  begin
+   if @status & 0x40 <> 0x40
+   begin
+    select @aux = 'use [' + @db + '] dbcc showfilestats(' + convert(varchar(2),@fileid) + ') with no_infomsgs'
+  
+    insert into #t_file
+    exec (@aux)
+ 
+    select  @nm_file_logic = flname
+     ,@qt_spc_tot = (convert(numeric(20,2),totalextents) * 64) / 1024
+     ,@qt_spc_ocp = (convert(numeric(20,2),usedextents) * 64) /1024
+     ,@tp_file = 'D'
+     ,@nm_file_phys = fpname
+    from #t_file
+    where fileid = @fileid
+   end
+   else
+   begin
+    select  @nm_file_logic = @flname
+     ,@qt_spc_tot = (convert(numeric(20,2),@size) * 8) / 1024
+     ,@qt_spc_ocp = null
+     ,@tp_file = 'L'
+     ,@nm_file_phys = @fpname
+   end
+ 
+   insert into #t_free_spc
+   exec master..xp_fixeddrives
+    
+   select @qt_free_spc_drv = vl_free
+   from #t_free_spc
+   where nm_drv = left(@nm_file_phys,1)
+    
+   --select @aux = 'dir ' + left(@nm_file_phys,2)
+ 
+   --insert into #t_free_spc (texto)
+   --exec master..xp_cmdshell @aux
+ 
+   --if @winver = '2000'
+   --begin
+   -- select  @aux = texto
+   -- from #t_free_spc
+   -- where codigo = ( select max(codigo) - 1
+   --    from #t_free_spc)
+ 
+   -- select @aux = rtrim(right(@aux,len(@aux) - (charindex(')',@aux,1))))
+     
+   -- select @qt_free_spc_drv = (convert(numeric(20,2),replace(left(@aux, len(@aux) - 11),'.','')) / 1024) / 1024
+   -- --select @qt_free_spc_drv = left(@aux, len(@aux) - 11)
+   --end
+   --else
+   --begin
+   -- select  @aux = texto
+   -- from #t_free_spc
+   -- where codigo = ( select max(codigo)
+   --    from #t_free_spc)
+ 
+   -- select @aux = rtrim(@aux)
+     
+   -- select @qt_free_spc_drv = (convert(numeric(20,2),replace(left(@aux, len(@aux) - 11),',','')) / 1024) / 1024
+   --end
+ 
+ 
+   insert into #t_db (
+     nm_db
+    ,nm_file_logic
+    ,qt_spc_tot
+    ,qt_spc_ocp
+    ,tp_file
+    ,nm_file_phys
+    ,qt_free_spc_drv)
+   values (
+     @db
+    ,@nm_file_logic
+    ,@qt_spc_tot
+    ,@qt_spc_ocp
+    ,@tp_file
+    ,@nm_file_phys
+    ,@qt_free_spc_drv)
+ 
+   delete from #t_free_spc
+ 
+   fetch next from cr_file into @fileid, @status, @flname, @fpname, @size
+  end
+ 
+  close cr_file
+  deallocate cr_file
+ 
+  drop table #t_file
+ 
+  fetch next from cr_db into @db
+ end
+ 
+ close cr_db
+ deallocate cr_db
+ 
+ select @maxlenlogic = max(len(nm_file_logic))
+  ,@maxlenphys = max(len(nm_file_phys))
+ from #t_db
+ 
+ if @volume is null
+ begin
+  if @result = 1
+  begin
+   select   nm_db      'Base'
+    ,left(nm_file_logic,@maxlenlogic)  'Arquivo Logico'
+    ,isnull(convert(varchar(20), qt_spc_tot),'') 'Espaco Total (MB)'
+    ,isnull(convert(varchar(20), qt_spc_ocp),'') 'Espaco Utilizado (MB)'
+    ,case tp_file
+     when 'D' then 'Dados'
+     when 'L' then 'Log'
+     end      'Tipo'
+    ,left(nm_file_phys,@maxlenphys)   'Arquivo Fisico'
+    ,qt_free_spc_drv    'Espaco Livre no Drive (MB)'
+   from  #t_db
+   order by nm_db, tp_file
+  end
+  else
+  begin
+   select  sum(qt_spc_tot)   total
+    ,sum(isnull(qt_spc_ocp,qt_spc_tot)) util
+    ,case tp_file
+     when 'D' then 'Dados'
+     when 'L' then 'Log'
+     end      Tipo
+   from  #t_db
+   group by tp_file
+  end   
+ end
+ else
+ begin
+  if @result = 1
+  begin
+   select   nm_db      'Base'
+    ,left(nm_file_logic,@maxlenlogic)  'Arquivo Logico'
+    ,isnull(convert(varchar(20), qt_spc_tot),'') 'Espaco Total (MB)'
+    ,isnull(convert(varchar(20), qt_spc_ocp),'') 'Espaco Utilizado (MB)'
+    ,case tp_file
+     when 'D' then 'Dados'
+     when 'L' then 'Log'
+     end      'Tipo'
+    ,left(nm_file_phys,@maxlenphys)   'Arquivo Fisico'
+    ,qt_free_spc_drv    'Espaco Livre no Drive (MB)'
+   from  #t_db
+   where left(nm_file_phys,1) = @volume
+   order by nm_db, tp_file
+  end
+  else
+  begin
+   select  sum(qt_spc_tot)   total
+    ,sum(isnull(qt_spc_ocp,qt_spc_tot)) util
+    ,case tp_file
+     when 'D' then 'Dados'
+     when 'L' then 'Log'
+     end      Tipo
+   from  #t_db
+   where left(nm_file_phys,1) = @volume
+   group by tp_file
+  end   
+ end
+ 
+ drop table #t_db
+  
+ drop table #t_free_spc
+end
+
+
+
+=====================
+18) check size log (archive)
+
+dbcc sqlperf(logspace)
+
+
+=====================
+19) check size db (mas nao mostra do log)
+
+sp_helpdb
+
+
+SELECT databases.name AS [Database Name],
+       materfiles.type_desc AS [File Type],
+       CAST((materfiles.Size * 8) / 1024.0 AS DECIMAL(18, 1)) AS [Initial Size (MB)],
+       'By '+IIF(materfiles.is_percent_growth = 1, CAST(materfiles.growth AS VARCHAR(10))+'%', CONVERT(VARCHAR(30), CAST((materfiles.growth * 8) / 1024.0 AS DECIMAL(18, 1)))+' MB') AS [Autogrowth],
+       IIF(materfiles.max_size = 0, 'No growth is allowed', IIF(materfiles.max_size = -1, 'Unlimited', CAST((CAST(materfiles.max_size AS BIGINT) * 8) / 1024 AS VARCHAR(30))+' MB')) AS [MaximumSize]
+FROM sys.master_files AS materfiles
+INNER JOIN sys.databases AS databases ON databases.database_id = materfiles.database_id
+WHERE databases.name='FIACESSOEP'
+
+
+=====================
+20)  concatenando ( + ) 
+
+
+select 'alter database ' + name + ' set recovery simple ;' 
+ from sys.sysdatabases
+
+
+
+=====================
+21) check collation 
+
+SELECT name, collation_name FROM sys.databases where collation_name = 'SQL_Latin1_General_CP850_CI_AI' order by name 
+
+=====================
+22)  drop user all database 
+
+  EXECUTE master.sys.sp_MSforeachdb 'USE [?]; 
+      DECLARE @Tsql NVARCHAR(MAX)
+      SET @Tsql = ''''
+
+      SELECT @Tsql = ''DROP USER '' + d.name
+      FROM sys.database_principals d
+      JOIN master.sys.server_principals s
+          ON s.sid = d.sid
+      WHERE s.name = ''MYAPP_LOGIN''
+
+      EXEC (@Tsql)
+  '
+  GO
+
+
+  EXECUTE master.sys.sp_MSforeachdb 'USE [?]; 
+  begin try
+    drop user [<put a name in here>]
+    print ''did drop at ?''
+  end try
+  begin catch
+    print ''did not drop at ?''
+  end catch
+  '
+  GO
+
+
+
+
+
+=====================
+23)  check restore rds  
+
+EXEC msdb.dbo.rds_task_status
+
+Verificar o andamento do alter collation / backup
+
+SELECT  des.login_name AS [Login],
+        der.command AS [Command],
+        dest.text AS [Command Text] ,
+        des.login_time AS [Login Time],
+        des.[host_name] AS [Hostname],
+        des.[program_name] AS [Program],
+        der.session_id AS [Session ID],
+        dec.client_net_address [Client Net Address],
+        der.status AS [Status],
+        DB_NAME(der.database_id) AS [Database Name]
+FROM    sys.dm_exec_requests der
+        INNER JOIN sys.dm_exec_connections dec
+                       ON der.session_id = dec.session_id
+        INNER JOIN sys.dm_exec_sessions des
+                       ON des.session_id = der.session_id
+        CROSS APPLY sys.dm_exec_sql_text(sql_handle) AS dest
+WHERE   des.is_user_process = 1;
+
+
+=====================
+24)  check restore
+
+
+SELECT session_id as SPID, command, a.text AS Query, start_time, percent_complete, dateadd(second,estimated_completion_time/1000, getdate()) as estimated_completion_time
+FROM sys.dm_exec_requests r CROSS APPLY sys.dm_exec_sql_text(r.sql_handle) a
+WHERE r.command in ('BACKUP DATABASE','RESTORE DATABASE');
+
+
+=====================
+25)  physical disk space usage:
+
+SELECT D.name AS [database_name]
+    , F.name AS [file_name]
+    , F.type_desc AS [file_type]
+    , CONVERT(decimal(10,2), F.size * 0.0078125) AS [size_on_disk_mb]
+    , CONVERT(decimal(10,2), F.max_size * 0.0078125) AS [max_size_mb]
+FROM sys.master_files AS F
+INNER JOIN sys.databases AS D
+    ON F.database_id = D.database_id;
+
+=====================
+26)  check connection in sql server by IP / program name
+
+sELECT  ecs.client_net_address, ecs.client_tcp_port, ess.[program_name], 
+        ess.[host_name], ess.login_name,
+        SUM(num_reads) TotalReads, SUM(num_writes) TotalWrites,
+        COUNT(ecs.session_id) AS SessionCount
+FROM sys.dm_exec_sessions AS ess WITH (NOLOCK) 
+INNER JOIN sys.dm_exec_connections AS ecs WITH (NOLOCK) 
+ON ess.session_id = ecs.session_id 
+GROUP BY    ecs.client_net_address, ecs.client_tcp_port, ess.[program_name], 
+        ess.[host_name], ess.login_name
+ORDER BY SessionCount DESC;
+
+
+=====================
+27) 
+
+0 é o numero do arquivo que vc quer ler (ele circula sendo 0 atual, 1 o anterior etc),
+1 é o tipo de log (2 seria o log do agent por exemplo)
+sp_readerrorlog 0,1
+
+
+=====================
+28)
+--procura a proc em todos dbs
+exec sp_msforeachdb 'use [?] select db_name(),name from sys.objects where name =''FI_SP_LOG_AlterarLogExecucaoV6'' and type =''p'''
+
+
+=====================
+29)
+check parallel / consumer memory
+
+
+
+SELECT mg.session_id
+,DB_NAME(st.dbid) as [DATABASE]
+,ses.host_name
+,ses.program_name
+,ses.login_name
+,mg.dop
+,datediff(second,mg.request_time,getdate()) seg_exec
+,mg.query_cost
+,mg.granted_memory_kb
+,mg.requested_memory_kb
+,mg.ideal_memory_kb
+,mg.request_time
+,mg.grant_time
+,st.[TEXT]
+,qp.query_plan
+FROM sys.dm_exec_query_memory_grants AS mg
+join sys.dm_exec_sessions ses on mg.session_id=ses.session_id
+CROSS APPLY sys.dm_exec_sql_text(mg.plan_handle) AS st
+CROSS APPLY sys.dm_exec_query_plan(mg.plan_handle) AS qp
+ORDER BY datediff(second,mg.request_time,getdate()) DESC
+
+
+
+=====================
+30)
+paginacao 
+
+
+select x.*,y.*,z.* 
+from (SELECT  getdate() as collectionTime,(committed_kb/1024) as Commited,(committed_target_kb/1024)  as targetcommited FROM sys.dm_os_sys_info)  as x,
+     (SELECT  (total_physical_memory_kb/1024) as totalMem,(available_physical_memory_kb/1024) as AvaiMem FROM sys.dm_os_sys_memory) as y,
+     (SELECT  sum(cntr_value)/count(*)  as PLE FROM sys.dm_os_performance_counters WHERE counter_name = 'Page Life expectancy' AND object_name LIKE '%buffer node%') as Z
+
+
+
+
+
+=====================
+31)
+kill session 
+
+
+kill all connections database:
+
+use master
+	Go
+	 
+	-- part 1
+	SET NOCOUNT ON
+	 
+	DECLARE @dbname varchar(50)
+	 
+	SET @dbname = 'EGUARDIAN' -- Put the database name here
+	 
+	 
+	DECLARE @strSQL varchar(255)
+	PRINT 'Killing Users'
+	PRINT '-----------------'
+	 
+	CREATE table #tmpUsers(
+	spid int,
+	eid int,
+	status varchar(30),
+	loginname varchar(50),
+	hostname varchar(50),
+	blk int,
+	dbname varchar(50),
+	cmd varchar(30),
+	request_id int)
+	 
+	INSERT INTO #tmpUsers EXEC SP_WHO
+	 
+	 
+	DECLARE LoginCursor CURSOR
+	READ_ONLY
+	FOR SELECT spid, dbname FROM #tmpUsers WHERE dbname = @dbname and spid <> @@SPID
+	 
+	DECLARE @spid varchar(10)
+	DECLARE @dbname2 varchar(40)
+	OPEN LoginCursor
+	 
+	FETCH NEXT FROM LoginCursor INTO @spid, @dbname2
+	WHILE (@@fetch_status <> -1)
+	BEGIN
+		IF (@@fetch_status <> -2)
+		BEGIN
+		PRINT 'Killing ' + @spid
+		SET @strSQL = 'KILL ' + @spid
+		EXEC (@strSQL)
+		END
+		FETCH NEXT FROM LoginCursor INTO  @spid, @dbname2
+	END
+	 
+	CLOSE LoginCursor
+	DEALLOCATE LoginCursor
+	 
+	DROP table #tmpUsers
+	go
+	--EXEC rdsadmin.dbo.rds_modify_db_name N'EGUARDIAN2', N'EGUARDIAN'
+	go
+
+
+
+
+=====================
+32)
+
+bcp 
+
+export:
+bcp dbname.schema_name.table_name out C:\table_name.txt -n -S localhost -U username -P password -b 10000 
+
+bcp ADV_EGUARDIAN.dbo.VIEW_INTEG_MOVFIN out D:\DBA\export_dump\VIEW_INTEG_MOVFIN -n -S rds-eguardian-restore-domingo.cgruhf3g9ewc.sa-east-1.rds.amazonaws.com -U dba_monitor -P dba_monitor -b 10000 
+
+import: 
+
+

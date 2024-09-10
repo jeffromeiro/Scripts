@@ -1,0 +1,1 @@
+select * FROM mysql.user;
